@@ -24,6 +24,7 @@ namespace MSBuildSerilogLogger
         {
             _logger = new LoggerConfiguration()
                 .WriteTo.LiterateConsole()
+                .WriteTo.Seq("http://localhost:5341/")
                 .CreateLogger();
         }
 
