@@ -8,6 +8,7 @@ using Serilog;
 using Serilog.Core;
 using Serilog.Events;
 using ILogger = Microsoft.Build.Framework.ILogger;
+using System.Collections;
 
 namespace MSBuildSerilogLogger
 {
@@ -19,6 +20,8 @@ namespace MSBuildSerilogLogger
         int _errors = 0;
 
         DateTime _buildStartedTime;
+
+        List<Frame> _frameStack = new List<Frame>();
 
         public SerilogLogger()
         {
@@ -66,10 +69,30 @@ namespace MSBuildSerilogLogger
 
         private void EventSource_ProjectStarted(object sender, ProjectStartedEventArgs e)
         {
+            Frame parentFrame = _frameStack.LastOrDefault();
+            Frame parentProject = Enumerable.Reverse(_frameStack).FirstOrDefault(f => f.Type == FrameType.Project);
+            _frameStack.Add(new Frame(FrameType.Project, e.ProjectFile, parentFrame));
+
+            string targets = string.IsNullOrEmpty(e.TargetNames) ? "default" : e.TargetNames;
+
+            var loggerWithContext = _logger.WithProperties(e.Properties);
+
+            //  TODO: log items
+
+            if (parentProject == null)
+            {
+                loggerWithContext.Information("Project {ProjectPath} ({Targets} targets)", e.ProjectFile, targets);
+            }
+            else
+            {
+                loggerWithContext.Information("Project {ParentProjectPath} is building {ProjectPath} ({Targets} targets)", parentProject.Name, e.ProjectFile, targets);
+            }
         }
 
         private void EventSource_ProjectFinished(object sender, ProjectFinishedEventArgs e)
         {
+            _logger.Information("Project Finished: {ProjectFinishedMessage}", e.Message);
+            _frameStack.RemoveAt(_frameStack.Count - 1);
         }
 
         private void EventSource_TargetStarted(object sender, TargetStartedEventArgs e)
@@ -112,6 +135,26 @@ namespace MSBuildSerilogLogger
 
         public LoggerVerbosity Verbosity { get; set; }
         public string Parameters { get; set; }
+
+        internal enum FrameType
+        {
+            Project,
+            Target
+        }
+
+        internal class Frame
+        {
+            public FrameType Type { get; }
+            public string Name { get; }
+            public Frame Parent { get; }
+
+            public Frame(FrameType type, string name, Frame parent)
+            {
+                Type = type;
+                Name = name;
+                Parent = parent;
+            }
+        }
     }
 
     static class LoggerExtensions
@@ -136,9 +179,20 @@ namespace MSBuildSerilogLogger
         {
             if (environment != null && environment.Any())
             {
-                logger = logger.ForContext("Properties", new Dictionary<string, string>(environment));
+                logger = logger.ForContext("Environment", new Dictionary<string, string>(environment));
             }
             return logger;
+        }
+
+        public static Serilog.ILogger WithProperties(this Serilog.ILogger logger,
+            IEnumerable properties)
+        {
+            var propertyDict = properties.Cast<DictionaryEntry>().ToDictionary(entry => (string) entry.Key, entry => (string) entry.Value);
+            if (!propertyDict.Any())
+            {
+                return logger;
+            }
+            return logger.ForContext("Properties", propertyDict);
         }
 
     }
