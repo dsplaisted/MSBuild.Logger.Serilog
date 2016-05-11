@@ -20,6 +20,9 @@ namespace MSBuildSerilogLogger
         int _errors = 0;
 
         DateTime _buildStartedTime;
+        bool _gotRootProjectStarted;
+        List<Action> _pendingLogMessages = new List<Action>();
+
 
         List<Frame> _frameStack = new List<Frame>();
 
@@ -53,9 +56,14 @@ namespace MSBuildSerilogLogger
         {
             _buildStartedTime = e.Timestamp;
 
-            _logger
-                .WithEnvironment(e.BuildEnvironment)
-                .Information("Build started {BuildStartedTime}", e.Timestamp);
+            //  Wait until we know what the root project is to log this message, so we can set its BuildID
+            _pendingLogMessages.Add(() =>
+            {
+                _logger
+                    .WithEnvironment(e.BuildEnvironment)
+                    .Information("Build started {BuildStartedTime}", e.Timestamp);
+            });
+
         }
 
         private void EventSource_BuildFinished(object sender, BuildFinishedEventArgs e)
@@ -69,6 +77,19 @@ namespace MSBuildSerilogLogger
 
         private void EventSource_ProjectStarted(object sender, ProjectStartedEventArgs e)
         {
+            if (!_gotRootProjectStarted)
+            {
+                //  Add a unique key for this build to each event
+                _logger = _logger.ForContext("BuildID", e.ProjectFile + "|" + _buildStartedTime.ToString("O"));
+                _gotRootProjectStarted = true;
+                foreach (var action in _pendingLogMessages)
+                {
+                    action();
+                }
+                _pendingLogMessages.Clear();
+            }
+
+
             Frame parentFrame = _frameStack.LastOrDefault();
             Frame parentProject = Enumerable.Reverse(_frameStack).FirstOrDefault(f => f.Type == FrameType.Project);
             _frameStack.Add(new Frame(FrameType.Project, e.ProjectFile, parentFrame));
