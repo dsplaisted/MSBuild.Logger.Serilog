@@ -29,9 +29,21 @@ namespace MSBuildSerilogLogger
         public SerilogLogger()
         {
             _logger = new LoggerConfiguration()
-                .WriteTo.LiterateConsole()
+                //.WriteTo.LiterateConsole()
                 .WriteTo.Seq("http://localhost:5341/")
                 .CreateLogger();
+        }
+
+        void PushFrame(Frame frame)
+        {
+            _frameStack.Add(frame);
+        }
+
+        Frame PopFrame()
+        {
+            var ret = _frameStack[_frameStack.Count - 1];
+            _frameStack.RemoveAt(_frameStack.Count - 1);
+            return ret;
         }
 
         public void Initialize(IEventSource eventSource)
@@ -92,7 +104,7 @@ namespace MSBuildSerilogLogger
 
             Frame parentFrame = _frameStack.LastOrDefault();
             Frame parentProject = Enumerable.Reverse(_frameStack).FirstOrDefault(f => f.Type == FrameType.Project);
-            _frameStack.Add(new Frame(FrameType.Project, e.ProjectFile, parentFrame));
+            PushFrame(new Frame(FrameType.Project, e.ProjectFile, parentFrame));
 
             string targets = string.IsNullOrEmpty(e.TargetNames) ? "default" : e.TargetNames;
 
@@ -112,40 +124,80 @@ namespace MSBuildSerilogLogger
 
         private void EventSource_ProjectFinished(object sender, ProjectFinishedEventArgs e)
         {
+            var currentFrame = PopFrame();
             _logger.Information("Project Finished: {ProjectFinishedMessage}", e.Message);
-            _frameStack.RemoveAt(_frameStack.Count - 1);
         }
 
         private void EventSource_TargetStarted(object sender, TargetStartedEventArgs e)
         {
+            Frame parentFrame = _frameStack.LastOrDefault();
+            PushFrame(new Frame(FrameType.Target, e.TargetName, parentFrame));
+
+            _logger
+                .WithStack(_frameStack)
+                .Information("Target {TargetName} from file {TargetFile} started", e.TargetName, e.TargetFile);
         }
 
         private void EventSource_TargetFinished(object sender, TargetFinishedEventArgs e)
         {
+            _logger
+                .WithStack(_frameStack)
+                .WithTargetOutputs(e.TargetOutputs)
+                .Information("Target Finished: {TargetFinishedMessage}", e.Message);
+
+            var currentFrame = PopFrame();
         }
 
         private void EventSource_TaskStarted(object sender, TaskStartedEventArgs e)
         {
+            Frame parentFrame = _frameStack.LastOrDefault();
+            PushFrame(new Frame(FrameType.Task, e.TaskName, parentFrame));
+
+            Frame parentProject = Enumerable.Reverse(_frameStack).FirstOrDefault(f => f.Type == FrameType.Project);
+            _logger
+                .WithStack(_frameStack)
+                .Information("Task started: {TaskStartedMessage}", e.Message);
         }
 
         private void EventSource_TaskFinished(object sender, TaskFinishedEventArgs e)
         {
+            _logger
+                .WithStack(_frameStack)
+                .Information("Task finished: {TaskFinishedMessage}", e.Message);
+
+            var currentFrame = PopFrame();
         }
 
         private void EventSource_ErrorRaised(object sender, BuildErrorEventArgs e)
         {
+            _errors++;
+
+            _logger
+                .WithStack(_frameStack)
+                .Error("Error: {ErrorMessage}", e.Message);
         }
 
         private void EventSource_WarningRaised(object sender, BuildWarningEventArgs e)
         {
+            _warnings++;
+
+            _logger
+                .WithStack(_frameStack)
+                .Warning("Warning: {WarningMessage}", e.Message);
         }
 
         private void EventSource_MessageRaised(object sender, BuildMessageEventArgs e)
         {
+            _logger
+                .WithStack(_frameStack)
+                .Information("{MessageImportance} message: {MessageText}", e.Importance, e.Message);
         }
 
         private void EventSource_CustomEventRaised(object sender, CustomBuildEventArgs e)
         {
+            _logger
+                .WithStack(_frameStack)
+                .Information("Custom message: {CustomMessageText}", e.Message);
         }
 
 
@@ -156,45 +208,31 @@ namespace MSBuildSerilogLogger
 
         public LoggerVerbosity Verbosity { get; set; }
         public string Parameters { get; set; }
+    }
 
-        internal enum FrameType
+    internal enum FrameType
+    {
+        Project,
+        Target,
+        Task
+    }
+
+    internal class Frame
+    {
+        public FrameType Type { get; }
+        public string Name { get; }
+        public Frame Parent { get; }
+
+        public Frame(FrameType type, string name, Frame parent)
         {
-            Project,
-            Target
-        }
-
-        internal class Frame
-        {
-            public FrameType Type { get; }
-            public string Name { get; }
-            public Frame Parent { get; }
-
-            public Frame(FrameType type, string name, Frame parent)
-            {
-                Type = type;
-                Name = name;
-                Parent = parent;
-            }
+            Type = type;
+            Name = name;
+            Parent = parent;
         }
     }
 
     static class LoggerExtensions
     {
-        //private class EnvironmentEnricher : ILogEventEnricher
-        //{
-        //    IDictionary<string, string> _environment;
-
-        //    public EnvironmentEnricher(IDictionary<string, string> environment)
-        //    {
-        //        _environment = environment;
-        //    }
-
-        //    public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)
-        //    {
-        //        propertyFactory.
-        //    }
-        //}
-
         public static Serilog.ILogger WithEnvironment(this Serilog.ILogger logger,
             IDictionary<string, string> environment)
         {
@@ -214,6 +252,58 @@ namespace MSBuildSerilogLogger
                 return logger;
             }
             return logger.ForContext("Properties", propertyDict);
+        }
+
+        public static Serilog.ILogger WithTargetOutputs(this Serilog.ILogger logger, IEnumerable targetOutputs)
+        {
+            if (targetOutputs != null)
+            {
+                var items = targetOutputs.Cast<ITaskItem>();
+                if (items.Any())
+                {
+                    return logger.ForContext("TargetOutputItems", items.Select(item => item.ItemSpec));
+                }
+            }
+            return logger;
+        }
+
+        public static Serilog.ILogger WithStack(this Serilog.ILogger logger, List<Frame> frameStack)
+        {
+            Frame taskFrame = null;
+            Frame targetFrame = null;
+            Frame projectFrame = null;
+
+            foreach (var frame in Enumerable.Reverse(frameStack))
+            {
+                if (frame.Type == FrameType.Task && taskFrame == null && targetFrame == null && projectFrame == null)
+                {
+                    taskFrame = frame;
+                }
+                else if (frame.Type == FrameType.Target && targetFrame == null && projectFrame == null)
+                {
+                    targetFrame = frame;
+                }
+                else if (frame.Type == FrameType.Project)
+                {
+                    projectFrame = frame;
+                    break;
+                }
+            }
+            
+            if (projectFrame != null)
+            {
+                logger = logger.ForContext("ProjectPath", projectFrame.Name);
+            }
+            if (targetFrame != null)
+            {
+                logger = logger.ForContext("TargetName", targetFrame.Name);
+            }
+            if (taskFrame != null)
+            {
+                logger = logger.ForContext("TaskName", taskFrame.Name);
+            }
+
+            return logger;
         }
 
     }
